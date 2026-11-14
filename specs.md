@@ -336,14 +336,16 @@ This server speaks two transports: `stdio` (for clients that spawn it as a child
 
 `list_recipes` must return quickly enough for an interactive LLM tool call (well under 10 s, ideally <1 s after warm-up). The Paprika cloud API has no batch "fetch all recipes" endpoint: each recipe body must be retrieved with `GET /sync/recipe/{uid}/`. Doing this sequentially for a real library (40–500+ recipes) blows past any LLM tool-call timeout, and Paprika additionally applies aggressive per-IP rate limiting (multi-minute IP blocks for bursty traffic, as documented by the community in the [reverse-engineered API gist](https://gist.github.com/mattdsteele/7386ec363badfdeaad05a418b9a1f30a)).
 
-The MCP server therefore maintains an in-memory recipe cache and only refetches what has actually changed.
+The MCP server therefore maintains an in-memory recipe cache, persists it to disk between restarts, and only refetches what has actually changed.
 
 ### Data model (in-process state)
 
 - `recipe_cache: dict[uid, recipe_dict]` — full recipe bodies as last seen.
 - `recipe_index_fingerprint: str` — SHA-256 over the sorted list of `(uid, hash)` pairs returned by `/sync/recipes`. This is the cheap "did anything change" signal.
-- `cache_ready: asyncio.Event` — set after the first successful warm-up so `list_recipes` callers either hit the cache instantly or, if called before warm-up completes, wait once.
-- `cache_lock: asyncio.Lock` — serializes refresh so concurrent tool calls don't all stampede the Paprika API.
+- `cache_ready: asyncio.Event` — set as soon as the warm-up starts (after loading the on-disk copy), so `list_recipes` never blocks a tool call for the minutes a paced first download can take.
+- `cache_lock: asyncio.Lock` — serializes refresh so concurrent tool calls don't all stampede the Paprika API. While it is held, `list_recipes` serves the recipes cached so far instead of waiting.
+- `refresh_progress: (downloaded, total)` — set while recipe bodies are downloading; the `list_recipes` tool prefixes its output with a "still downloading (N of M)" note so the LLM knows the list may be incomplete.
+- `rate_limit_backoff: bool` — true while the warm-up is waiting out a 429; `list_recipes` then serves the cache without calling Paprika (or returns `paprika_rate_limited` if the cache is empty).
 
 ### Invalidation strategy
 
@@ -355,16 +357,32 @@ Each `list_recipes` invocation runs this minimal protocol:
 3. If changed, diff against the cache:
    - **drop** any uid no longer in the index (deleted on the server).
    - **stale** = uids whose hash differs from the cached hash, plus uids not yet in the cache.
-4. Refetch only the stale recipes via `/sync/recipe/{uid}/`, with a concurrency cap (`asyncio.Semaphore(3)`) and a small jitter (~50 ms) between requests to stay under Paprika's rate limit.
-5. Update the cache and the fingerprint.
+4. Refetch only the stale recipes via `/sync/recipe/{uid}/`, **one at a time** with a minimum gap of `RECIPE_FETCH_INTERVAL_SECONDS` (0.5 s) between requests to stay under Paprika's rate limit.
+5. **Stop at the first 429.** Every further request during a block only extends it, so the batch ends immediately: recipes fetched so far are kept (and saved), the fingerprint is *not* committed, and `PaprikaRateLimitedError` is raised so the caller can back off. The next refresh fetches only what is still missing.
+6. Update the cache and the fingerprint, and save the cache to disk if anything changed.
 
 This mirrors how the official Paprika app keeps in sync (small status check + selective per-recipe pull) and is the explicitly-recommended pattern from the community gist to avoid IP bans.
 
 ### Startup warm-up
 
-On server startup the MCP server schedules a background warm-up task that performs a full refresh (every recipe is "stale" the first time) using the same concurrency-capped fetcher. The server itself becomes ready immediately so MCP clients can connect and use grocery tools without delay; only `list_recipes` blocks on `cache_ready` if it is invoked before the warm-up has finished.
+On server startup the MCP server schedules a background warm-up task. It first loads the on-disk cache (see below), then runs a normal refresh, so after the first run only recipes that changed while the server was down are downloaded. The server itself becomes ready immediately so MCP clients can connect and use grocery tools without delay.
 
-If warm-up encounters errors (e.g. Paprika rate-limit, transient network failure), it logs them and leaves the cache partially populated. A subsequent `list_recipes` call will retry the missing recipes.
+When the refresh hits a 429, the warm-up waits and resumes:
+
+- wait `Retry-After` seconds if Paprika sent that header (delta-seconds form), otherwise `RATE_LIMIT_BACKOFF_SECONDS` (30 s) doubling per retry up to `RATE_LIMIT_BACKOFF_MAX_SECONDS` (300 s);
+- the retry counter resets whenever a retry made progress;
+- after `RATE_LIMIT_MAX_RETRIES` (5) consecutive retries without progress it gives up and logs; the next `list_recipes` call retries the missing recipes.
+
+Other errors (network failure, bad credentials) are logged and end the warm-up; the cache keeps whatever was loaded.
+
+During the very first download (no on-disk copy yet), `list_recipes` returns the recipes downloaded so far, and recipe lookups by name in other tools can miss recipes that haven't arrived yet.
+
+### On-disk cache
+
+- Location: `data/recipe_cache.json` (gitignored), overridable with the `PAPRIKA_RECIPE_CACHE_FILE` environment variable; an empty value disables persistence.
+- Contents: format version, an owner tag (SHA-256 of the lower-cased Paprika username, so a file is never reused for another account), the committed index fingerprint, and the recipe bodies.
+- Written atomically (temp file + rename) with mode `0600`, after every refresh that changed the cache and every 50 recipes during a long download, so an interrupted first download resumes where it stopped.
+- A missing, corrupt, other-account or old-format file is ignored and the cache refills from Paprika.
 
 ### Trash and limits
 

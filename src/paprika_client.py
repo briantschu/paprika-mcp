@@ -3,21 +3,32 @@ import gzip
 import hashlib
 import json
 import logging
-import random
+import os
 import uuid
 import difflib
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import aiohttp
 
 logger = logging.getLogger(__name__)
 
-# Concurrency cap and inter-request jitter for refetching individual recipe
-# bodies. Paprika applies aggressive per-IP rate limiting (multi-minute IP
-# blocks for bursty traffic), so the cache refresh fans out gently.
-RECIPE_FETCH_CONCURRENCY = 3
-RECIPE_FETCH_JITTER_SECONDS = 0.05
+# Pacing for refetching individual recipe bodies. Paprika applies aggressive
+# per-IP rate limiting (HTTP 429, multi-minute blocks for bursty traffic), so
+# recipe bodies are fetched one at a time with a minimum gap between requests.
+RECIPE_FETCH_INTERVAL_SECONDS = 0.5
+
+# Backoff after a 429 during the background warm-up. Paprika's Retry-After
+# header wins when present; otherwise wait BASE, doubling up to MAX. After
+# MAX_RETRIES consecutive 429s the warm-up gives up; the next list_recipes
+# call picks up the recipes that are still missing.
+RATE_LIMIT_BACKOFF_SECONDS = 30.0
+RATE_LIMIT_BACKOFF_MAX_SECONDS = 300.0
+RATE_LIMIT_MAX_RETRIES = 5
+
+# On-disk recipe cache format version; bump when the layout changes.
+RECIPE_CACHE_FILE_VERSION = 1
 
 # Meal type mapping for the Paprika meal planner.
 # Source: API_REFERENCE.md §Meal Plans (verified live 2026-06-29).
@@ -149,9 +160,17 @@ class PaprikaAuthError(PaprikaAPIError):
 
 
 class PaprikaRateLimitedError(PaprikaAPIError):
-    """Paprika is throttling us (HTTP 429 or temporary IP block)."""
+    """Paprika is throttling us (HTTP 429 or temporary IP block).
+
+    ``retry_after`` holds the seconds from Paprika's ``Retry-After`` header
+    when it sent one. It is kept off ``extra`` so it never reaches clients.
+    """
 
     code = "paprika_rate_limited"
+
+    def __init__(self, message: str, retry_after: Optional[float] = None, **extra: Any):
+        super().__init__(message, **extra)
+        self.retry_after = retry_after
 
 
 class InvalidArgumentError(PaprikaAPIError):
@@ -196,18 +215,41 @@ class AmbiguousMatchError(PaprikaAPIError):
         self.candidates = candidates
 
 
+def _parse_retry_after(value: Optional[str]) -> Optional[float]:
+    """Return Retry-After as seconds, or None if absent/not a number.
+
+    Only the delta-seconds form is supported; the HTTP-date form is ignored
+    and the caller falls back to its own backoff.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        seconds = float(value.strip())
+    except ValueError:
+        return None
+    return seconds if seconds >= 0 else None
+
+
 class PaprikaClient:
     """Client for interacting with the Paprika Recipe Manager API."""
 
     BASE_URL = "https://paprikaapp.com/api"
 
-    def __init__(self, username: str, password: str):
+    def __init__(
+        self,
+        username: str,
+        password: str,
+        cache_file: Optional[Union[str, Path]] = None,
+    ):
         """
         Initialize the Paprika client.
 
         Args:
             username: Paprika account email
             password: Paprika account password
+            cache_file: Optional path for the on-disk recipe cache. When set,
+                the cache is loaded at warm-up and saved after each refresh
+                that changes it, so a restart only refetches changed recipes.
         """
         self.username = username
         self.password = password
@@ -219,6 +261,13 @@ class PaprikaClient:
         self._recipe_index_fingerprint: Optional[str] = None
         self._cache_lock = asyncio.Lock()
         self._cache_ready = asyncio.Event()
+        self._cache_file: Optional[Path] = Path(cache_file) if cache_file else None
+        # Progress of an in-flight refresh: (fetched so far, total to fetch).
+        self._refresh_progress: Optional[Tuple[int, int]] = None
+        # True while the warm-up is sleeping off a 429.
+        self._rate_limit_backoff = False
+        # Recipes fetched by the most recent refresh (also set when it raised).
+        self._last_refresh_fetched = 0
 
         # Aisle mapping cache
         self._aisle_cache: Optional[Dict[str, str]] = None
@@ -393,7 +442,8 @@ class PaprikaClient:
         if status in (429, 503):
             raise PaprikaRateLimitedError(
                 "Paprika is rate-limiting us. Please try again in a couple "
-                "of minutes."
+                "of minutes.",
+                retry_after=_parse_retry_after(response.headers.get("Retry-After")),
             )
         raise PaprikaAPIError(
             "Paprika returned an unexpected error. I've logged the details."
@@ -689,21 +739,86 @@ class PaprikaClient:
         response = await self._make_authenticated_request("GET", "/sync/recipes")
         return response.get("result", []) or []
 
-    async def _fetch_full_recipe(
-        self, uid: str, semaphore: asyncio.Semaphore
-    ) -> Optional[Dict[str, Any]]:
-        """Fetch a single recipe body, gated by the shared semaphore."""
-        async with semaphore:
-            # Small jitter so we don't hammer the API in lockstep.
-            await asyncio.sleep(random.uniform(0, RECIPE_FETCH_JITTER_SECONDS))
-            try:
-                resp = await self._make_authenticated_request(
-                    "GET", f"/sync/recipe/{uid}/"
-                )
-                return resp.get("result") or None
-            except Exception as e:
-                logger.warning(f"Failed to fetch recipe {uid}: {e}")
-                return None
+    async def _fetch_full_recipe(self, uid: str) -> Optional[Dict[str, Any]]:
+        """Fetch a single recipe body.
+
+        Returns None on most failures so one bad recipe doesn't sink the
+        refresh. ``PaprikaRateLimitedError`` is re-raised: once Paprika says
+        429, every further request just extends the block, so the caller must
+        stop the batch.
+        """
+        try:
+            resp = await self._make_authenticated_request(
+                "GET", f"/sync/recipe/{uid}/"
+            )
+            return resp.get("result") or None
+        except PaprikaRateLimitedError:
+            raise
+        except Exception as e:
+            logger.warning(f"Failed to fetch recipe {uid}: {e}")
+            return None
+
+    # -- on-disk recipe cache -------------------------------------------------
+
+    def _cache_owner(self) -> str:
+        """Opaque per-account tag so a cache file is never reused across accounts."""
+        return hashlib.sha256(self.username.strip().lower().encode()).hexdigest()
+
+    def _load_cache_from_disk(self) -> bool:
+        """Load the recipe cache from ``cache_file``. Returns True if loaded.
+
+        Any problem (missing, corrupt, other account, old format) is logged
+        and ignored: the cache simply starts empty and refills from Paprika.
+        """
+        if not self._cache_file or not self._cache_file.exists():
+            return False
+        try:
+            data = json.loads(self._cache_file.read_text(encoding="utf-8"))
+            if (
+                data.get("version") != RECIPE_CACHE_FILE_VERSION
+                or data.get("owner") != self._cache_owner()
+                or not isinstance(data.get("recipes"), dict)
+            ):
+                logger.info("Ignoring recipe cache file (other account or format)")
+                return False
+        except (OSError, ValueError) as e:
+            logger.warning("Could not read recipe cache file, starting empty: %s", e)
+            return False
+
+        self._recipe_cache = data["recipes"]
+        self._recipe_index_fingerprint = data.get("fingerprint")
+        logger.info("Loaded %d recipes from the on-disk cache", len(self._recipe_cache))
+        return True
+
+    def _save_cache_to_disk(self) -> None:
+        """Write the recipe cache to ``cache_file`` atomically (mode 0600)."""
+        if not self._cache_file:
+            return
+        payload = json.dumps({
+            "version": RECIPE_CACHE_FILE_VERSION,
+            "owner": self._cache_owner(),
+            "fingerprint": self._recipe_index_fingerprint,
+            "recipes": self._recipe_cache,
+        })
+        tmp = self._cache_file.with_name(self._cache_file.name + ".tmp")
+        try:
+            self._cache_file.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+            os.replace(tmp, self._cache_file)
+        except OSError as e:
+            logger.warning("Could not write recipe cache file: %s", e)
+
+    @property
+    def recipe_loading_progress(self) -> Optional[Tuple[int, int]]:
+        """(downloaded, total) while a refresh is downloading recipes, else None."""
+        return self._refresh_progress if self._cache_lock.locked() else None
+
+    @property
+    def recipe_download_paused(self) -> bool:
+        """True while the warm-up is waiting out a Paprika rate limit."""
+        return self._rate_limit_backoff
 
     async def refresh_recipe_cache(self, force: bool = False) -> int:
         """Refresh the in-memory recipe cache against the Paprika server.
@@ -712,8 +827,12 @@ class PaprikaClient:
           1. GET /sync/recipes (cheap index of {uid, hash}).
           2. If the index fingerprint matches the cached one and not
              ``force``, no per-recipe fetches are performed.
-          3. Otherwise diff: drop deleted uids, refetch new or hash-changed
-             uids in parallel under a small concurrency cap.
+          3. Otherwise diff: drop deleted uids, then refetch new or
+             hash-changed uids one at a time, RECIPE_FETCH_INTERVAL_SECONDS
+             apart.
+          4. On the first 429 the batch stops. Recipes fetched so far are
+             kept (and saved to disk), and PaprikaRateLimitedError is raised
+             so the caller can back off; the next refresh fetches the rest.
 
         Returns the number of recipe bodies (re)fetched in this call.
         """
@@ -752,44 +871,112 @@ class PaprikaClient:
             ]
 
             fetched = 0
+            rate_limited: Optional[PaprikaRateLimitedError] = None
             if stale_uids:
-                semaphore = asyncio.Semaphore(RECIPE_FETCH_CONCURRENCY)
-                results = await asyncio.gather(
-                    *(self._fetch_full_recipe(uid, semaphore) for uid in stale_uids)
-                )
-                for uid, recipe in zip(stale_uids, results):
+                logger.info("Downloading %d recipes from Paprika", len(stale_uids))
+            self._refresh_progress = (0, len(stale_uids))
+            try:
+                for i, uid in enumerate(stale_uids):
+                    if i:
+                        await asyncio.sleep(RECIPE_FETCH_INTERVAL_SECONDS)
+                    try:
+                        recipe = await self._fetch_full_recipe(uid)
+                    except PaprikaRateLimitedError as e:
+                        rate_limited = e
+                        logger.warning(
+                            "Paprika is rate-limiting us; stopping after %d of "
+                            "%d recipes. The rest will be fetched later.",
+                            i, len(stale_uids),
+                        )
+                        break
+                    self._refresh_progress = (i + 1, len(stale_uids))
                     if recipe is None:
                         # Leave any prior cached copy in place; we'll retry next
                         # refresh. Don't update fingerprint either.
                         continue
                     self._recipe_cache[uid] = recipe
                     fetched += 1
+                    if fetched % 50 == 0:
+                        # Checkpoint so an interrupted first download resumes.
+                        self._save_cache_to_disk()
+            finally:
+                self._refresh_progress = None
 
             # Only commit the new fingerprint if every stale recipe was fetched
             # successfully; otherwise the next call will retry the misses.
             if fetched == len(stale_uids):
                 self._recipe_index_fingerprint = fingerprint
+            if fetched or deleted:
+                self._save_cache_to_disk()
 
             self._cache_ready.set()
             logger.info(
                 "Recipe cache refresh: %d total, %d (re)fetched, %d deleted",
                 len(self._recipe_cache), fetched, len(deleted),
             )
+            self._last_refresh_fetched = fetched
+            if rate_limited is not None:
+                raise rate_limited
             return fetched
 
     async def warm_up_cache(self) -> None:
-        """Populate the recipe cache from scratch. Intended for startup.
+        """Populate the recipe cache at startup, gently.
 
-        Logs and swallows errors so a transient Paprika failure does not
+        Loads the on-disk cache first (if configured) so only recipes that
+        changed since the last run are downloaded. When Paprika rate-limits
+        us, waits (Retry-After, else exponential backoff) and resumes; it
+        gives up after RATE_LIMIT_MAX_RETRIES consecutive 429s without
+        progress. Logs and swallows errors so a Paprika failure does not
         prevent the MCP server from coming up.
         """
-        try:
-            await self.refresh_recipe_cache(force=True)
-        except Exception as e:
-            logger.warning(f"Initial recipe cache warm-up failed: {e}")
-            # Still mark ready so callers don't block forever; they'll get an
-            # empty list the first time and a real refresh attempt next call.
-            self._cache_ready.set()
+        self._load_cache_from_disk()
+        # Mark ready immediately: list_recipes serves whatever is cached (the
+        # saved copy, or recipes as they arrive) with a "still loading" note,
+        # instead of blocking a tool call for the minutes a paced first
+        # download can take.
+        self._cache_ready.set()
+
+        attempt = 0
+        while True:
+            try:
+                await self.refresh_recipe_cache()
+                return
+            except PaprikaRateLimitedError as e:
+                if self._last_refresh_fetched:
+                    attempt = 0  # made progress; this is a fresh limit
+                if attempt >= RATE_LIMIT_MAX_RETRIES:
+                    logger.warning(
+                        "Recipe warm-up giving up after %d rate-limited retries; "
+                        "%d recipes cached. The rest load on the next "
+                        "list_recipes call.",
+                        attempt, len(self._recipe_cache),
+                    )
+                    break
+                delay = (
+                    e.retry_after
+                    if e.retry_after is not None
+                    else min(
+                        RATE_LIMIT_BACKOFF_SECONDS * 2 ** attempt,
+                        RATE_LIMIT_BACKOFF_MAX_SECONDS,
+                    )
+                )
+                attempt += 1
+                logger.warning(
+                    "Paprika rate limit: waiting %.0f s before resuming the "
+                    "recipe download (retry %d of %d)",
+                    delay, attempt, RATE_LIMIT_MAX_RETRIES,
+                )
+                self._rate_limit_backoff = True
+                try:
+                    await asyncio.sleep(delay)
+                finally:
+                    self._rate_limit_backoff = False
+            except Exception as e:
+                logger.warning(f"Initial recipe cache warm-up failed: {e}")
+                break
+        # Still mark ready so callers don't block forever; they'll get what
+        # is cached and a real refresh attempt on the next call.
+        self._cache_ready.set()
 
     async def list_recipes(self, limit: int = 50, query: str = "") -> List[Dict[str, Any]]:
         """
@@ -809,14 +996,27 @@ class PaprikaClient:
         Raises:
             PaprikaAPIError: If the lightweight index call fails.
         """
-        try:
-            await self.refresh_recipe_cache()
-        except PaprikaAPIError:
-            # If the index call itself fails but we have a populated cache,
-            # serve stale data rather than failing the LLM tool call.
+        if self._rate_limit_backoff:
+            # The warm-up is waiting out a 429; asking Paprika again now would
+            # only extend the block. Serve what we have.
             if not self._recipe_cache:
-                raise
-            logger.warning("Serving recipes from stale cache after refresh failure")
+                raise PaprikaRateLimitedError(
+                    "Paprika is rate-limiting us. I'll have your recipes "
+                    "ready in a couple of minutes."
+                )
+        elif self._cache_lock.locked() and self._cache_ready.is_set():
+            # A refresh (usually the startup download) is in progress. Serve
+            # the recipes cached so far instead of waiting minutes for it.
+            pass
+        else:
+            try:
+                await self.refresh_recipe_cache()
+            except PaprikaAPIError:
+                # If the refresh fails but we have a populated cache, serve
+                # stale data rather than failing the LLM tool call.
+                if not self._recipe_cache:
+                    raise
+                logger.warning("Serving recipes from stale cache after refresh failure")
 
         # Wait once for the very first warm-up if a caller raced the server.
         if not self._cache_ready.is_set():

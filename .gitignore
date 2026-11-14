@@ -61,3 +61,7 @@ htmlcov/
 # Client feedback (MCP standard section 10) - may contain personal content
 data/feedback.jsonl
 data/feedback_decisions.jsonl
+
+# Recipe cache (personal recipe data)
+data/recipe_cache.json
+data/recipe_cache.json.tmp
