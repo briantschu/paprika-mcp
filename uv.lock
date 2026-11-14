@@ -659,7 +659,7 @@ wheels = [
 [[package]]
 name = "paprika-mcp"
 version = "1.0.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
     { name = "anyio" },

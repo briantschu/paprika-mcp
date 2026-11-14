@@ -1,5 +1,9 @@
 # Project metadata + dependencies (single source of truth).
 # Follows the shared MCP standard: Python 3.12, uv, committed lockfile.
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "paprika-mcp"
 version = "1.0.0"
@@ -30,9 +34,10 @@ Homepage = "https://github.com/mspoorendonk/paprika-mcp"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
-
-[tool.setuptools.packages.find]
-where = ["src"]
+# src/ holds flat top-level modules (server imports `audit`, `config`, ...),
+# not a package. Install editable (uv's default) so data/ paths that resolve
+# relative to these files keep pointing at the repo's data/ directory.
+py-modules = ["server", "paprika_client", "config", "audit", "feedback", "oauth_app"]
 
 [dependency-groups]
 dev = [
