@@ -310,7 +310,7 @@ This server speaks two transports: `stdio` (for clients that spawn it as a child
 
 ### 2. Home Assistant
 - **Transport**: Streamable HTTP at `/mcp`.
-- **Requirements**: Home Assistant's *Model Context Protocol* integration connects over HTTP/HTTPS to the `/mcp` endpoint (e.g. `http://<ip>:8000/mcp` internally, or `https://user:pass@example.com/<prefix>/mcp` through a reverse proxy with Basic Auth).
+- **Requirements**: Home Assistant's *Model Context Protocol* integration connects over HTTP/HTTPS to the `/mcp` endpoint (e.g. `http://<lan-ip>:8001/mcp` on the server's unauthenticated LAN listener, `--lan-host`/`--lan-port`). Home Assistant asks for a fixed OAuth client ID and secret when a server requires login, while this server only supports dynamic client registration, so Home Assistant uses the LAN listener rather than the OAuth-protected public endpoint.
 
 ### 3. Google Antigravity
 - **Transport**: `stdio` or Streamable HTTP.
