@@ -29,10 +29,10 @@ Supported agents:
 
 ## Prerequisites
 
-- Python 3.8 or higher
-- [Paprika Recipe Manager 3](https://www.paprikaapp.com/) with cloud sync enabled
-- [Claude Desktop](https://claude.ai/download) application
-- Valid Paprika account credentials
+- [uv](https://docs.astral.sh/uv/) (installs Python 3.12 for you if needed)
+- [Paprika Recipe Manager 3](https://www.paprikaapp.com/) with cloud sync enabled, and your Paprika account email and password
+- An MCP client, e.g. Claude Desktop, Claude Code, VS Code (Copilot), Gemini CLI, Google Antigravity, or Home Assistant (see [Connect a client](#connect-a-client))
+- Optional: [Node.js](https://nodejs.org/) for the MCP Inspector test in step 3
 
 ## Quick Start
 
@@ -51,80 +51,172 @@ uv sync --extra dev
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 ```
 
+This also installs the `paprika-mcp` command at `.venv/bin/paprika-mcp`, which is what MCP clients launch.
+
 ### 2. Configuration
 
-Copy the example environment file and configure your credentials:
+Copy the template and fill in your Paprika credentials:
 
 ```bash
-cp .env.example .env
+cp .env.template .env
 ```
 
-Edit `.env` with your Paprika credentials:
 ```env
 PAPRIKA_USERNAME=your_email@example.com
 PAPRIKA_PASSWORD=your_paprika_password
 ```
 
+That is all a local (stdio) setup needs. The `OAUTH_*` / `GOOGLE_*` variables are only for running it as a network service (see [LAN Deployment](#lan-deployment-run-as-a-network-service)). The server finds `.env` next to the code no matter which directory a client starts it from, so client configs don't need to repeat your password.
+
 ### 3. Test the Server
 
-Verify your setup by testing authentication:
+Use the official [MCP Inspector](https://github.com/modelcontextprotocol/inspector) to start the server and call its tools from a browser UI:
 
 ```bash
-python src/server.py --username your_email --password your_password
+npx @modelcontextprotocol/inspector .venv/bin/paprika-mcp
 ```
 
-### 4. Configure Claude Desktop
+Click **Connect**, open **Tools**, and run `get_groceries`. On the first start the server downloads your recipes in the background (paced to stay under Paprika's rate limit), so `list_recipes` may report that it is still loading for a few minutes.
 
-Edit your Claude Desktop configuration file:
+## Connect a client
 
-**macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
-**Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+There are two ways to connect:
 
-Add the MCP server configuration:
+- **Local (stdio):** the client starts `.venv/bin/paprika-mcp` on the same machine. Simplest; nothing listens on the network.
+- **Remote (Streamable HTTP):** the server runs as a network service (see [LAN Deployment](#lan-deployment-run-as-a-network-service)) and clients connect to `https://<your-domain>/<prefix>/mcp`, logging in with Google via OAuth.
+
+Replace `/path/to/paprika-mcp` with the absolute path to your clone.
+
+### Claude Desktop
+
+**Local:** Open the config file in one of two ways:
+
+- **From the app:** click the **Claude** menu in your operating system's menu bar (macOS: top of the screen; not the settings inside the Claude window, which have no Developer tab), choose **Settings…**, open the **Developer** tab, and click **Edit Config**. This creates the file if it doesn't exist.
+- **Directly:** macOS `~/Library/Application Support/Claude/claude_desktop_config.json`, Windows `%APPDATA%\Claude\claude_desktop_config.json`, Linux `~/.config/Claude/claude_desktop_config.json`. On macOS, open it in TextEdit with:
+
+  ```bash
+  open -e ~/Library/Application\ Support/Claude/claude_desktop_config.json
+  ```
+
+The file may already contain the app's own settings (e.g. a `preferences` block). Leave those alone and add `mcpServers` as another top-level key, or add `paprika` to it if `mcpServers` already exists:
 
 ```json
 {
   "mcpServers": {
     "paprika": {
-      "command": "/path/to/your/.venv/bin/python",
-      "args": ["/path/to/paprika-mcp/src/server.py"],
-      "env": {
-        "PAPRIKA_USERNAME": "your_email@example.com",
-        "PAPRIKA_PASSWORD": "your_password"
-      }
+      "command": "/path/to/paprika-mcp/.venv/bin/paprika-mcp"
     }
   }
 }
 ```
 
-**Important**: Use absolute paths and ensure you're pointing to your virtual environment's Python interpreter.
+Fully quit Claude Desktop (not just close the window) and reopen it. To check that it loaded, click the **+** ("Add files, connectors, and more") button in the message box → **Connectors** → **Manage connectors** and look for `paprika`. If it's missing, check the logs in `~/Library/Logs/Claude/` (`mcp.log` and `mcp-server-paprika.log`).
 
-### 5. Restart Claude Desktop
+**Remote:** Go to **Settings → Connectors → Add custom connector** and enter `https://<your-domain>/<prefix>/mcp`. Remote servers can't be added through the JSON file. Custom connectors are reached from Anthropic's cloud, not from your computer, so the URL must be publicly reachable over HTTPS.
 
-Completely quit and restart Claude Desktop for the changes to take effect.
+### Claude Code (CLI)
+
+```bash
+# Local
+claude mcp add paprika -- /path/to/paprika-mcp/.venv/bin/paprika-mcp
+
+# Remote
+claude mcp add --transport http paprika https://<your-domain>/<prefix>/mcp
+```
+
+For the remote server, run `/mcp` in Claude Code (or `claude mcp login paprika`) to complete the Google login in your browser.
+
+### VS Code (GitHub Copilot)
+
+Run **MCP: Add Server** from the Command Palette and follow the guided setup, or edit the config file by hand: `~/.copilot/mcp-config.json` for all projects, or `.mcp.json` in a workspace root:
+
+```json
+{
+  "mcpServers": {
+    "paprika-local": {
+      "type": "stdio",
+      "command": "/path/to/paprika-mcp/.venv/bin/paprika-mcp"
+    },
+    "paprika-remote": {
+      "type": "http",
+      "url": "https://<your-domain>/<prefix>/mcp"
+    }
+  }
+}
+```
+
+The older `.vscode/mcp.json` file (with a `"servers"` key) still works but is deprecated, and the `github.copilot.chat.mcpServers` setting is no longer documented.
+
+### Gemini CLI
+
+```bash
+# Local
+gemini mcp add --scope user paprika /path/to/paprika-mcp/.venv/bin/paprika-mcp
+
+# Remote
+gemini mcp add --transport http --scope user paprika https://<your-domain>/<prefix>/mcp
+```
+
+Or edit `~/.gemini/settings.json` directly. Gemini CLI uses `httpUrl` for Streamable HTTP (`url` means SSE):
+
+```json
+{
+  "mcpServers": {
+    "paprika-local": {
+      "command": "/path/to/paprika-mcp/.venv/bin/paprika-mcp"
+    },
+    "paprika-remote": {
+      "httpUrl": "https://<your-domain>/<prefix>/mcp"
+    }
+  }
+}
+```
+
+Gemini runs the OAuth flow and opens a browser for the Google login on first connect.
+
+### Google Antigravity
+
+Edit Antigravity's MCP config (from the agent panel's MCP server settings, or directly at `~/.gemini/config/mcp_config.json`; older versions use `~/.gemini/antigravity/mcp_config.json`). Remote servers use `serverUrl`, not the older `httpUrl`:
+
+```json
+{
+  "mcpServers": {
+    "paprika-local": {
+      "command": "/path/to/paprika-mcp/.venv/bin/paprika-mcp"
+    },
+    "paprika-remote": {
+      "serverUrl": "https://<your-domain>/<prefix>/mcp"
+    }
+  }
+}
+```
+
+### Home Assistant
+
+Home Assistant connects over the network, so run the server as a network service first (see below). In Home Assistant: **Settings → Devices & Services → Add Integration → "Model Context Protocol"**, and enter the server's `/mcp` URL.
+
+Home Assistant's integration asks for a fixed OAuth client ID and secret when a server requires login, but this server only supports clients that register themselves automatically. So connect Home Assistant to the unauthenticated **LAN listener** instead: start the server with `--lan-host <lan-ip> --lan-port 8001` and enter `http://<lan-ip>:8001/mcp`. Keep that port off your public reverse proxy.
+
+### Claude.ai and Gemini (web)
+
+Web clients can't start local programs, so they need the remote server at a public HTTPS URL. In Claude.ai, add it under **Settings → Connectors → Add custom connector** and complete the Google login. For Gemini on the web, check Google's current documentation for custom MCP server support.
 
 ## LAN Deployment (Run as a Network Service)
 
-If you want the MCP server to be centrally accessible by multiple agents across your network (e.g., Home Assistant OS on one machine and Claude Code on another), run the server in HTTP mode. It exposes a single Streamable HTTP endpoint at `/mcp` — the current MCP standard, used by all supported clients (Claude Desktop, Claude Code, Home Assistant, Gemini CLI, VS Code Copilot, Antigravity, Claude.ai web, Gemini web).
+To share one server between several clients and machines (e.g. Home Assistant and Claude Code), run it in HTTP mode. It exposes a single Streamable HTTP endpoint at `/mcp`.
 
-### 1. Start the Server in HTTP Mode on Linux
-
-Run the server on your dedicated Linux machine, binding to your LAN IP address:
+### 1. Start the Server in HTTP Mode
 
 ```bash
-# Keep this running, e.g., using systemd or tmux
-python src/server.py --http --host 0.0.0.0 --port 8000
+# Keep this running, e.g. with systemd or tmux.
+# Primary listener: OAuth-protected (put this one behind your HTTPS reverse proxy).
+# LAN listener: no auth, for Home Assistant on your local network only.
+.venv/bin/paprika-mcp --http --host 127.0.0.1 --port 8000 --lan-host <lan-ip> --lan-port 8001
 ```
 
-### 2. Configure Home Assistant (HAOS)
+The primary listener requires the OAuth configuration in [section 3](#3-authentication--oauth2-with-google-login). For a purely local network with no reverse proxy, `--no-auth` makes the primary listener unauthenticated too.
 
-In Home Assistant: **Settings → Devices & Services → Add Integration → "Model Context Protocol"**. Point it at the `/mcp` endpoint:
-
-- **Server URL:** `http://<linux-machine-ip>:8000/mcp`
-
-Over a public HTTPS reverse proxy, point it at the proxied URL (`https://example.com/<prefix>/mcp`); the integration runs the OAuth flow (see [section 4](#4-authentication--oauth2-with-google-login)).
-
-### 3. Reverse-Proxy Notes
+### 2. Reverse-Proxy Notes
 
 When fronting the server with nginx (or similar):
 
@@ -132,7 +224,7 @@ When fronting the server with nginx (or similar):
 - Disable buffering for streaming: `proxy_buffering off; proxy_cache off; chunked_transfer_encoding off;` and a long `proxy_read_timeout`.
 - Set `proxy_http_version 1.1` and `proxy_set_header Connection '';`.
 
-### 4. Authentication — OAuth2 with Google login
+### 3. Authentication — OAuth2 with Google login
 
 Authentication is OAuth 2.0 — the server is its own Authorization Server and
 brokers the human login to Google (OIDC), allow-listing by email. HTTP
@@ -140,10 +232,11 @@ Basic-Auth at nginx is **retired**; clients no longer need per-client
 passwords. See [`src/oauth_app.py`](src/oauth_app.py) for the implementation.
 
 Server-side config lives in `.env` (gitignored): `OAUTH_ISSUER_URL`,
-`OAUTH_PATH_PREFIX`, the Google OAuth client credentials, and the email
-allowlist. MCP clients only need the endpoint URL — they run the OAuth flow
-automatically and log in with Google in the browser. Access is revoked by
-removing an email from the allowlist.
+`OAUTH_PATH_PREFIX`, the Google OAuth client credentials (`GOOGLE_CLIENT_ID`,
+`GOOGLE_CLIENT_SECRET`), and the email allowlist (`OAUTH_ALLOWED_EMAILS`).
+MCP clients only need the endpoint URL — they register themselves, run the
+OAuth flow automatically, and log in with Google in the browser. Access is
+revoked by removing an email from the allowlist.
 
 ## Usage Examples
 
@@ -297,17 +390,16 @@ gitleaks detect --source .
 #### Authentication Failed
 - Verify your Paprika credentials work at [paprikaapp.com](https://paprikaapp.com)
 - Ensure cloud sync is enabled in your Paprika app
-- Check that credentials are correctly set in environment variables
+- Check that `PAPRIKA_USERNAME` and `PAPRIKA_PASSWORD` are set in `.env`
 
-#### Claude Connection Issues
-- Verify Python path in Claude config points to your virtual environment
-- Check that server.py path is absolute and correct
-- Ensure all required packages are installed in the virtual environment
+#### Client Can't Connect
+- Point the client at the absolute path of `.venv/bin/paprika-mcp`; if that file is missing, run `uv sync --extra dev`
+- Fully restart the client after changing its config
+- Try the server on its own with the MCP Inspector (Quick Start step 3) to tell server problems from client problems
 
-#### Import Errors
-- Confirm virtual environment is activated
-- Reinstall dependencies: `uv pip install -e .`
-- Check Python version compatibility (3.12+)
+#### Import Errors (e.g. `No module named 'mcp.server.fastmcp'`)
+- Reinstall from the lockfile: `uv sync --extra dev`. Don't use `uv pip install`, which ignores the lockfile and can pull an incompatible `mcp` 2.x
+- Check that the venv uses Python 3.12 (`.venv/bin/python --version`)
 
 ## API Rate Limiting
 
@@ -358,74 +450,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ---
 
 **Note**: This is an unofficial integration and is not affiliated with or endorsed by Paprika Recipe Manager or Anthropic.
-### Configure VS Code GitHub Copilot
-
-Add the MCP server to your VS Code `settings.json`:
-
-```json
-{
-  "github.copilot.chat.mcpServers": {
-    "paprika-local": {
-      "command": "/path/to/paprika-mcp/.venv/bin/paprika-mcp"
-    },
-    "paprika-remote": {
-      "url": "https://<your-domain>/<prefix>/mcp"
-    }
-  }
-}
-```
-
-### Configure Claude Code (CLI)
-
-Use the streamable HTTP transport. The endpoint uses OAuth (see
-[section 4](#4-authentication--oauth2-with-google-login)); Claude Code runs the
-OAuth flow and opens a browser for the Google login on first connect:
-
-```bash
-claude mcp add --transport http paprika https://<your-domain>/paprika/mcp
-```
-
-For a local stdio install: `claude mcp add paprika -- /path/to/paprika-mcp/.venv/bin/paprika-mcp`.
-
-### Configure Google Antigravity
-
-Use the built-in MCP connection configuration with the streamable HTTP URL:
-
-```json
-{
-  "mcpServers": {
-    "paprika": {
-      "httpUrl": "https://<your-domain>/<prefix>/mcp"
-    }
-  }
-}
-```
-
-### Configure Gemini CLI
-
-Gemini CLI's `settings.json` distinguishes streamable HTTP (`httpUrl`) from SSE (`url`):
-
-```json
-{
-  "mcpServers": {
-    "paprika-local": {
-      "command": "/path/to/paprika-mcp/.venv/bin/paprika-mcp"
-    },
-    "paprika-remote": {
-      "httpUrl": "https://<your-domain>/paprika/mcp"
-    }
-  }
-}
-```
-
-or from the CLI: 
-```cli
-gemini mcp add --transport http --scope user paprika https://<your-domain>/paprika/mcp
-```
-
-The endpoint uses OAuth (see [section 4](#4-authentication--oauth2-with-google-login)); Gemini runs the OAuth flow and opens a browser for the Google login on first connect.
-
-
-### Web Clients (Claude.ai & Gemini Web)
-
-For cloud / web clients to interact with your local Paprika deployment, give them your public HTTPS streamable HTTP URL (`https://<your-domain>/<prefix>/mcp`) as a custom connector. They complete the OAuth flow (see [section 4](#4-authentication--oauth2-with-google-login)) with a Google login — no per-client credentials to share.
