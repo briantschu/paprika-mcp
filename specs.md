@@ -246,11 +246,13 @@ Catch-all for any other non-2xx Paprika response (e.g. 5xx, malformed JSON). The
   - `meals` (required) — List of meals to schedule. Each meal requires:
     - `recipe_name_or_id` (required) — Name or UID of the recipe.
     - `date` (required) — Target date in `YYYY-MM-DD` format.
-    - `meal_type` (optional, default `"dinner"`) — One of `breakfast`, `lunch`, `dinner`, `snack`. Case-insensitive.
+    - `meal_type` (optional, default `"dinner"`) — The name of one of the account's meal types: the built-in `breakfast`, `lunch`, `dinner`, `snack`, or a custom one (e.g. `make-ahead`). Matching ignores case, punctuation and a trailing "s" (`snack` matches *Snacks*); a renamed built-in type still matches its original slot name. An unknown name returns `invalid_argument` listing the account's meal types.
 - **Returns**: Plain-text spoken confirmation: number of meals scheduled, and details per meal.
 - **Errors**: `recipe_not_found` if any recipe cannot be resolved; `invalid_argument` if the date format or meal type is invalid; standard connectivity codes.
-- **API**: POSTs a gzip-compressed JSON array to `POST /v2/sync/meals/`. There is no per-uid meals endpoint; all meal plan writes go to the array endpoint. `type_uid` is sent as an empty string (Paprika ignores it). `date` uses `"YYYY-MM-DD 00:00:00"` format.
-- **Meal type integers**: `breakfast=0`, `lunch=1`, `dinner=2`, `snack=3` (as used in the Paprika sync API).
+- **API**: POSTs a gzip-compressed JSON array to `POST /v2/sync/meals/`. There is no per-uid meals endpoint; all meal plan writes go to the array endpoint. `date` uses `"YYYY-MM-DD 00:00:00"` format.
+- **Meal types (`type_uid`)**: Paprika decides a planned meal's category from `type_uid`, the `uid` of one of the account's meal types from `GET /v2/sync/mealtypes/` (`{uid, name, original_type, order_flag, color, export_time, export_all_day}`). An empty `type_uid` puts the meal in the wrong category. The server reads the meal types once per run (so changes in the app are picked up when the server restarts) and re-reads them once when a name doesn't match. It sets `type_uid` on every write.
+- **Meal type integers (`type`)**: legacy field, kept in sync with the meal type's `original_type`: `breakfast=0`, `lunch=1`, `dinner=2`, `snack=3`. Custom types have no `original_type`; the server sends `3`, which is what the Paprika app stored for almost all entries of a custom type. `type` doesn't decide the category: real entries of one custom type carry both `0` and `3`.
+- **Fallback**: if `/sync/mealtypes` returns nothing usable, the server falls back to the four built-in slots with an empty `type_uid` and logs a warning. Rate-limit, auth and connectivity errors are returned as usual.
 
 ### Scenario 12 — Reviewing past meals and upcoming meal plans
 
@@ -271,7 +273,7 @@ Catch-all for any other non-2xx Paprika response (e.g. 5xx, malformed JSON). The
 - **Parameters**:
   - `days_back` (optional, default `30`, min `0`, max `365`) — Number of past days to look back for meals eaten.
   - `days_ahead` (optional, default `14`, min `0`, max `365`) — Number of future days to look ahead for planned meals.
-- **Returns**: Plain-text overview split into past meals and upcoming meals, with day of the week, meal type, recipe names, and entry IDs (`[id: <uid>]`).
+- **Returns**: Plain-text overview split into past meals and upcoming meals, with day of the week, meal type, recipe names, and entry IDs (`[id: <uid>]`). The meal type is the name of the entry's `type_uid` meal type (e.g. `make-ahead`), falling back to the numeric `type` for entries without one; meals within a day are ordered by the meal types' `order_flag`.
 - **Errors**: Standard connectivity codes.
 - **API**: Queries `GET /v2/sync/meals/`.
 
@@ -288,6 +290,12 @@ Catch-all for any other non-2xx Paprika response (e.g. 5xx, malformed JSON). The
 - LLM calls `move_planned_meal` with `date="2026-10-22"`, `meal_type="dinner"`, `to_date="2026-10-23"`.
 - Server updates the meal's `date` and syncs.
 - **Assistant:** "Moved planned meal *Kipfilet* to tomorrow."
+
+> **User:** "Saturday's casserole should be under make-ahead, not breakfast."
+
+- LLM calls `move_planned_meal` with the entry's `entry_id` (from `get_plan`), the same `to_date`, and `to_meal_type="make-ahead"`.
+- Server sets the entry's `type_uid` (and `type`) to the *Make-ahead* meal type and syncs. `meal_type`/`to_meal_type` in `delete_planned_meal` and `move_planned_meal` accept the same names as `plan_meals`, and matching uses `type_uid`.
+- **Assistant:** "Moved the casserole to make-ahead on Saturday."
 
 ### Scenario 14 — Updating existing grocery items
 
