@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import random
+import re
 import uuid
 import difflib
 from datetime import datetime
@@ -19,8 +20,13 @@ logger = logging.getLogger(__name__)
 RECIPE_FETCH_CONCURRENCY = 3
 RECIPE_FETCH_JITTER_SECONDS = 0.05
 
-# Meal type mapping for the Paprika meal planner.
-# Source: API_REFERENCE.md §Meal Plans (verified live 2026-06-29).
+# Legacy numeric meal slots. Each meal entry also carries ``type_uid``, which
+# points at one of the account's meal types from /sync/mealtypes (including
+# custom ones such as "Make-ahead"). Paprika decides the category from
+# ``type_uid``; an entry with an empty ``type_uid`` lands in the wrong
+# category. ``type`` is kept in sync with the meal type's ``original_type``.
+# These numbers are only used to match the built-in types and as a fallback
+# when the account's meal types can't be read.
 MEAL_TYPE_MAP: dict[str, int] = {
     "breakfast": 0,
     "lunch": 1,
@@ -28,6 +34,21 @@ MEAL_TYPE_MAP: dict[str, int] = {
     "snack": 3,
 }
 INV_MEAL_TYPE_MAP: dict[int, str] = {v: k for k, v in MEAL_TYPE_MAP.items()}
+
+# Used when /sync/mealtypes can't be read (empty type_uid = legacy behaviour).
+FALLBACK_MEAL_TYPES: List[Dict[str, Any]] = [
+    {"uid": "", "name": name.capitalize(), "original_type": num, "order_flag": num}
+    for name, num in MEAL_TYPE_MAP.items()
+]
+
+# Custom meal types have no original_type. Entries the Paprika app created for
+# one custom type were almost all stored with type 3, so use that.
+CUSTOM_MEAL_TYPE_INT = 3
+
+
+def _norm_meal_type(value: str) -> str:
+    """Normalise a meal type name for matching: 'Make-ahead' -> 'makeahead'."""
+    return re.sub(r"[^a-z0-9]", "", (value or "").lower())
 
 # Keyword mapping for grocery auto-categorization into Paprika aisles.
 # Supports both Dutch and English common items.
@@ -222,6 +243,10 @@ class PaprikaClient:
 
         # Aisle mapping cache
         self._aisle_cache: Optional[Dict[str, str]] = None
+
+        # The account's meal planner types (see _get_meal_types).
+        # Read once per server run; re-read only when a name doesn't match.
+        self._meal_types: Optional[List[Dict[str, Any]]] = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create an aiohttp session."""
@@ -1422,6 +1447,115 @@ class PaprikaClient:
 
         return {"uid": item["uid"], "name": item["name"], "list_uid": item.get("list_uid", "unknown")}
 
+    # -- meal types ------------------------------------------------------------
+
+    async def _get_meal_types(self, refresh: bool = False) -> List[Dict[str, Any]]:
+        """The account's meal types from /sync/mealtypes, read once per server run.
+
+        Each has ``uid``, ``name``, ``original_type`` (0-3 for the built-in
+        Breakfast/Lunch/Dinner/Snacks, None for custom types) and
+        ``order_flag``. Falls back to FALLBACK_MEAL_TYPES (empty uids) if
+        Paprika returns something unexpected; connectivity, auth and
+        rate-limit errors propagate. The fallback isn't cached, so the next
+        call tries Paprika again.
+        """
+        if self._meal_types is not None and not refresh:
+            return self._meal_types
+
+        types: List[Dict[str, Any]] = []
+        try:
+            res = await self._make_authenticated_request("GET", "/sync/mealtypes")
+            for t in res.get("result") or []:
+                # Meal types have no date; anything else isn't one.
+                if isinstance(t, dict) and t.get("uid") and t.get("name") and "date" not in t:
+                    types.append(t)
+        except (PaprikaRateLimitedError, PaprikaAuthError, PaprikaUnreachableError):
+            raise
+        except PaprikaAPIError as e:
+            logger.warning("Could not read meal types, using built-in slots: %s", e)
+
+        if not types:
+            logger.warning("No meal types from Paprika; using built-in slots without type_uid")
+            return FALLBACK_MEAL_TYPES
+        self._meal_types = sorted(types, key=lambda t: t.get("order_flag") or 0)
+        return self._meal_types
+
+    @staticmethod
+    def _match_meal_type(query: str, types: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Find a meal type by name ('snack' ~ 'Snacks', 'make ahead' ~ 'Make-ahead')."""
+        q = _norm_meal_type(query)
+        if not q:
+            return None
+        for t in types:
+            n = _norm_meal_type(t.get("name", ""))
+            if n == q or n.rstrip("s") == q.rstrip("s"):
+                return t
+        # A renamed built-in type ("Supper" for dinner) still matches its slot.
+        singular = q[:-1] if q.endswith("s") else q
+        slot = MEAL_TYPE_MAP.get(q, MEAL_TYPE_MAP.get(singular))
+        if slot is not None:
+            for t in types:
+                if t.get("original_type") == slot:
+                    return t
+        return None
+
+    async def _resolve_meal_type(self, query: str) -> Dict[str, Any]:
+        """Resolve a meal type name to one of the account's meal types.
+
+        Raises InvalidArgumentError listing the account's meal types if
+        nothing matches (after one re-read, in case a type was just added).
+        """
+        types = await self._get_meal_types()
+        match = self._match_meal_type(query, types)
+        if match is None:
+            types = await self._get_meal_types(refresh=True)
+            match = self._match_meal_type(query, types)
+        if match is None:
+            names = ", ".join(t["name"] for t in types)
+            raise InvalidArgumentError(
+                f"Unknown meal type '{query}'. Your meal types are: {names}."
+            )
+        return match
+
+    @staticmethod
+    def _meal_type_int(meal_type: Dict[str, Any]) -> int:
+        """The legacy numeric ``type`` to store alongside ``type_uid``."""
+        original = meal_type.get("original_type")
+        return original if isinstance(original, int) else CUSTOM_MEAL_TYPE_INT
+
+    @staticmethod
+    def _meal_type_of(meal: Dict[str, Any], types: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """The meal type a planner entry belongs to (by type_uid, else by number)."""
+        type_uid = meal.get("type_uid")
+        if type_uid:
+            for t in types:
+                if t.get("uid") == type_uid:
+                    return t
+            return None
+        for t in types:
+            if t.get("original_type") == meal.get("type", 2):
+                return t
+        return None
+
+    def _meal_type_label(self, meal: Dict[str, Any], types: List[Dict[str, Any]]) -> str:
+        """Lower-case meal type name for a planner entry, e.g. 'dinner', 'make-ahead'."""
+        t = self._meal_type_of(meal, types)
+        if t is not None:
+            return t["name"].lower()
+        return INV_MEAL_TYPE_MAP.get(meal.get("type", 2), "dinner")
+
+    def _meal_has_type(self, meal: Dict[str, Any], meal_type: Dict[str, Any], types: List[Dict[str, Any]]) -> bool:
+        """Whether a planner entry belongs to the given meal type."""
+        t = self._meal_type_of(meal, types)
+        if t is not None:
+            return t is meal_type or (bool(t.get("uid")) and t.get("uid") == meal_type.get("uid"))
+        return meal.get("type") == self._meal_type_int(meal_type)
+
+    def _set_meal_type(self, meal: Dict[str, Any], meal_type: Dict[str, Any]) -> None:
+        """Point a planner entry at a meal type (both type_uid and type)."""
+        meal["type_uid"] = meal_type.get("uid") or ""
+        meal["type"] = self._meal_type_int(meal_type)
+
     async def plan_meals(
         self,
         requests: List[Dict[str, Any]],
@@ -1433,7 +1567,8 @@ class PaprikaClient:
             requests: List of dicts, each with keys:
                 - ``recipe_name_or_id`` (str)
                 - ``date`` (str in YYYY-MM-DD format)
-                - ``meal_type`` (optional str, defaults to "dinner")
+                - ``meal_type`` (optional str, defaults to "dinner"): the
+                  name of one of the account's meal types, built-in or custom
 
         Returns:
             List of dicts with keys ``uid``, ``recipe_name``, ``recipe_uid``,
@@ -1470,14 +1605,7 @@ class PaprikaClient:
         for req in requests:
             recipe_query = req.get("recipe_name_or_id", "")
             date_str = req.get("date", "")
-            meal_type = req.get("meal_type", "dinner").lower().strip()
-
-            if meal_type not in MEAL_TYPE_MAP:
-                raise InvalidArgumentError(
-                    f"Unknown meal type '{meal_type}'. "
-                    f"Use one of: {', '.join(MEAL_TYPE_MAP)}."
-                )
-            type_int = MEAL_TYPE_MAP[meal_type]
+            meal_type = await self._resolve_meal_type(req.get("meal_type") or "dinner")
 
             try:
                 from datetime import datetime as _dt
@@ -1493,24 +1621,24 @@ class PaprikaClient:
             recipe_name = recipe.get("name", recipe_uid)
             meal_uid = self._generate_uuid()
 
-            meal_objs.append({
+            meal_obj = {
                 "uid": meal_uid,
                 "recipe_uid": recipe_uid,
                 "date": f"{date_str} 00:00:00",
-                "type": type_int,
                 "name": recipe_name,
                 "order_flag": 0,
-                "type_uid": "",
                 "scale": None,
                 "is_ingredient": False,
                 "deleted": False,
-            })
+            }
+            self._set_meal_type(meal_obj, meal_type)
+            meal_objs.append(meal_obj)
             results.append({
                 "uid": meal_uid,
                 "recipe_name": recipe_name,
                 "recipe_uid": recipe_uid,
                 "date": date_str,
-                "meal_type": meal_type,
+                "meal_type": meal_type["name"].lower(),
             })
 
         # Single bulk POST
@@ -1551,6 +1679,8 @@ class PaprikaClient:
 
         res = await self._make_authenticated_request("GET", "/sync/meals")
         raw_meals = res.get("result", [])
+        types = await self._get_meal_types()
+        type_order = {t["name"].lower(): t.get("order_flag") or 0 for t in types}
 
         from datetime import datetime, date, timedelta
         ref = reference_date if reference_date is not None else date.today()
@@ -1569,8 +1699,7 @@ class PaprikaClient:
                 continue
 
             if start_date <= meal_date <= end_date:
-                type_int = meal.get("type", 2)
-                meal_type_str = INV_MEAL_TYPE_MAP.get(type_int, "dinner")
+                meal_type_str = self._meal_type_label(meal, types)
                 filtered_meals.append({
                     "uid": meal.get("uid"),
                     "recipe_uid": meal.get("recipe_uid"),
@@ -1580,7 +1709,6 @@ class PaprikaClient:
                     "order_flag": meal.get("order_flag", 0),
                 })
 
-        type_order = {"breakfast": 0, "lunch": 1, "dinner": 2, "snack": 3}
         filtered_meals.sort(key=lambda m: (m["date"], type_order.get(m["meal_type"], 99), m["order_flag"]))
 
         return filtered_meals
@@ -1617,6 +1745,7 @@ class PaprikaClient:
         res = await self._make_authenticated_request("GET", "/sync/meals")
         raw_meals = res.get("result", [])
         active_meals = [m for m in raw_meals if not m.get("deleted", False)]
+        types = await self._get_meal_types()
 
         matched_meal = None
         if entry_id:
@@ -1638,13 +1767,8 @@ class PaprikaClient:
             candidates = [m for m in active_meals if (m.get("date") or "")[:10] == date]
 
             if meal_type:
-                mt_clean = meal_type.lower().strip()
-                if mt_clean not in MEAL_TYPE_MAP:
-                    raise InvalidArgumentError(
-                        f"Unknown meal type '{meal_type}'. Use one of: {', '.join(MEAL_TYPE_MAP)}."
-                    )
-                type_int = MEAL_TYPE_MAP[mt_clean]
-                candidates = [m for m in candidates if m.get("type") == type_int]
+                wanted = await self._resolve_meal_type(meal_type)
+                candidates = [m for m in candidates if self._meal_has_type(m, wanted, types)]
 
             if recipe_name_or_id:
                 r_query = recipe_name_or_id.lower().strip()
@@ -1664,7 +1788,7 @@ class PaprikaClient:
 
             if len(candidates) > 1:
                 summary = ", ".join(
-                    f"'{m.get('name')}' (id: {m.get('uid')}, type: {INV_MEAL_TYPE_MAP.get(m.get('type', 2), 'dinner')})"
+                    f"'{m.get('name')}' (id: {m.get('uid')}, type: {self._meal_type_label(m, types)})"
                     for m in candidates
                 )
                 raise AmbiguousMatchError(
@@ -1673,7 +1797,7 @@ class PaprikaClient:
                         {
                             "entry_id": m.get("uid"),
                             "name": m.get("name"),
-                            "meal_type": INV_MEAL_TYPE_MAP.get(m.get("type", 2), "dinner"),
+                            "meal_type": self._meal_type_label(m, types),
                         }
                         for m in candidates
                     ],
@@ -1688,7 +1812,7 @@ class PaprikaClient:
         await self._make_authenticated_request("POST", "/sync/meals", data=data)
 
         m_date = (matched_meal.get("date") or "")[:10]
-        m_type = INV_MEAL_TYPE_MAP.get(matched_meal.get("type", 2), "dinner")
+        m_type = self._meal_type_label(matched_meal, types)
         logger.info(f"Deleted planned meal {matched_meal.get('uid')} ({matched_meal.get('name')} on {m_date})")
 
         return {
@@ -1719,15 +1843,6 @@ class PaprikaClient:
                 f"Invalid destination date '{to_date}'. Use YYYY-MM-DD format (e.g. 2026-07-05)."
             )
 
-        new_type_int = None
-        if to_meal_type:
-            tmt_clean = to_meal_type.lower().strip()
-            if tmt_clean not in MEAL_TYPE_MAP:
-                raise InvalidArgumentError(
-                    f"Unknown destination meal type '{to_meal_type}'. Use one of: {', '.join(MEAL_TYPE_MAP)}."
-                )
-            new_type_int = MEAL_TYPE_MAP[tmt_clean]
-
         if not entry_id and not date:
             raise InvalidArgumentError(
                 "Please provide either 'entry_id' or 'date' to identify the planned meal to move."
@@ -1736,6 +1851,7 @@ class PaprikaClient:
         res = await self._make_authenticated_request("GET", "/sync/meals")
         raw_meals = res.get("result", [])
         active_meals = [m for m in raw_meals if not m.get("deleted", False)]
+        types = await self._get_meal_types()
 
         matched_meal = None
         if entry_id:
@@ -1756,13 +1872,8 @@ class PaprikaClient:
 
             candidates = [m for m in active_meals if (m.get("date") or "")[:10] == date]
             if meal_type:
-                mt_clean = meal_type.lower().strip()
-                if mt_clean not in MEAL_TYPE_MAP:
-                    raise InvalidArgumentError(
-                        f"Unknown meal type '{meal_type}'. Use one of: {', '.join(MEAL_TYPE_MAP)}."
-                    )
-                type_int = MEAL_TYPE_MAP[mt_clean]
-                candidates = [m for m in candidates if m.get("type") == type_int]
+                wanted = await self._resolve_meal_type(meal_type)
+                candidates = [m for m in candidates if self._meal_has_type(m, wanted, types)]
 
             if recipe_name_or_id:
                 r_query = recipe_name_or_id.lower().strip()
@@ -1782,7 +1893,7 @@ class PaprikaClient:
 
             if len(candidates) > 1:
                 summary = ", ".join(
-                    f"'{m.get('name')}' (id: {m.get('uid')}, type: {INV_MEAL_TYPE_MAP.get(m.get('type', 2), 'dinner')})"
+                    f"'{m.get('name')}' (id: {m.get('uid')}, type: {self._meal_type_label(m, types)})"
                     for m in candidates
                 )
                 raise AmbiguousMatchError(
@@ -1791,7 +1902,7 @@ class PaprikaClient:
                         {
                             "entry_id": m.get("uid"),
                             "name": m.get("name"),
-                            "meal_type": INV_MEAL_TYPE_MAP.get(m.get("type", 2), "dinner"),
+                            "meal_type": self._meal_type_label(m, types),
                         }
                         for m in candidates
                     ],
@@ -1800,8 +1911,11 @@ class PaprikaClient:
             matched_meal = candidates[0]
 
         matched_meal["date"] = f"{to_date} 00:00:00"
-        if new_type_int is not None:
-            matched_meal["type"] = new_type_int
+        final_type = self._meal_type_label(matched_meal, types)
+        if to_meal_type:
+            new_type = await self._resolve_meal_type(to_meal_type)
+            self._set_meal_type(matched_meal, new_type)
+            final_type = new_type["name"].lower()
         matched_meal["deleted"] = False
 
         gzipped_data = self._gzip_json([matched_meal])
@@ -1809,7 +1923,6 @@ class PaprikaClient:
         data.add_field("data", gzipped_data, content_type="application/octet-stream", filename="data.gz")
         await self._make_authenticated_request("POST", "/sync/meals", data=data)
 
-        final_type = INV_MEAL_TYPE_MAP.get(matched_meal.get("type", 2), "dinner")
         logger.info(f"Moved planned meal {matched_meal.get('uid')} to {to_date} ({final_type})")
 
         return {
