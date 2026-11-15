@@ -529,7 +529,10 @@ class MealRequest(BaseModel):
     )
     meal_type: str = Field(
         default="dinner",
-        description="Meal slot: 'breakfast', 'lunch', 'dinner' (default), or 'snack'."
+        description="Meal type, by name, from the user's Paprika meal planner: "
+                    "'breakfast', 'lunch', 'dinner' (default), 'snack', or any custom "
+                    "type the user has (e.g. 'make-ahead'). Matching ignores case, "
+                    "punctuation and a trailing 's'."
     )
 
 @mcp.tool()
@@ -640,7 +643,7 @@ async def delete_planned_meal(
         description="Date in YYYY-MM-DD format (e.g. '2026-10-22') to locate the planned meal when entry_id is not known.",
     )] = None,
     meal_type: Annotated[Optional[str], Field(
-        description="Optional meal slot ('breakfast', 'lunch', 'dinner', 'snack') to disambiguate when multiple meals are planned on the same date.",
+        description="Optional meal type name ('breakfast', 'lunch', 'dinner', 'snack', or a custom type such as 'make-ahead') to disambiguate when multiple meals are planned on the same date.",
     )] = None,
     recipe_name_or_id: Annotated[Optional[str], Field(
         description="Optional recipe name or UID to disambiguate when multiple meals are planned on the same date.",
@@ -669,7 +672,7 @@ async def move_planned_meal(
         description="Target destination date in YYYY-MM-DD format (e.g. '2026-10-25').",
     )],
     to_meal_type: Annotated[Optional[str], Field(
-        description="Optional new meal slot ('breakfast', 'lunch', 'dinner', 'snack'). Defaults to keeping the current meal type.",
+        description="Optional new meal type name ('breakfast', 'lunch', 'dinner', 'snack', or a custom type such as 'make-ahead'). Use this to change a meal's category. Defaults to keeping the current meal type.",
     )] = None,
     entry_id: Annotated[Optional[str], Field(
         description="The entry UID of the planned meal to move (from get_plan).",
@@ -678,7 +681,7 @@ async def move_planned_meal(
         description="Current date in YYYY-MM-DD format to locate the meal if entry_id is not known.",
     )] = None,
     meal_type: Annotated[Optional[str], Field(
-        description="Current meal slot ('breakfast', 'lunch', 'dinner', 'snack') to disambiguate if entry_id is not known.",
+        description="Current meal type name ('breakfast', 'lunch', 'dinner', 'snack', or a custom type) to disambiguate if entry_id is not known.",
     )] = None,
     recipe_name_or_id: Annotated[Optional[str], Field(
         description="Optional recipe name or UID to disambiguate if entry_id is not known.",

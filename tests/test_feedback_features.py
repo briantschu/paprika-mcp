@@ -21,10 +21,20 @@ from src.paprika_client import (
 import src.server as server
 
 
+MEAL_TYPES = [
+    {"uid": "BREAKFAST-UID", "name": "Breakfast", "original_type": 0, "order_flag": 0},
+    {"uid": "LUNCH-UID", "name": "Lunch", "original_type": 1, "order_flag": 1},
+    {"uid": "DINNER-UID", "name": "Dinner", "original_type": 2, "order_flag": 2},
+    {"uid": "SNACKS-UID", "name": "Snacks", "original_type": 3, "order_flag": 3},
+]
+
+
 @pytest.fixture
 def client():
     c = PaprikaClient("test@example.com", "pass")
     c.token = "fake-token"
+    # Preload the account's meal types so planner tests make no extra request.
+    c._meal_types = MEAL_TYPES
     return c
 
 
