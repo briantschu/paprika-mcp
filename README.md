@@ -198,7 +198,7 @@ Remove choco from my grocery list.
 | `create_recipe` | Create a new recipe with all details |
 | `update_recipe` | Complete recipe update (all fields) |
 | `update_recipe_partial` | Update only specified fields |
-| `list_recipes` | List all recipes with ingredients and details. Served from a hash-validated in-memory cache so repeated calls are fast and stay under Paprika's per-IP rate limit (see `specs.md` → "Recipe cache"). The cache is warmed in the background at server startup. |
+| `list_recipes` | List all recipes with ingredients and details. Served from a hash-validated in-memory cache so repeated calls are fast and stay under Paprika's per-IP rate limit (see `specs.md` → "Recipe cache"). The cache is warmed in the background at server startup, one recipe at a time, pausing automatically when Paprika rate-limits, and saved to `data/recipe_cache.json` so restarts only download recipes that changed. |
 | `get_groceries` | List unchecked grocery items on the Paprika grocery list (set `include_purchased=true` to include checked items) |
 | `add_grocery_item` | Add a new item to the Paprika grocery list. Automatically assigns an appropriate aisle/category (based on user history and keywords) so items are never uncategorized. |
 | `update_grocery_item` | Update properties of an existing grocery item (aisle/category, name, quantity, instruction, list, or purchased status) |
@@ -311,7 +311,13 @@ gitleaks detect --source .
 
 ## API Rate Limiting
 
-The Paprika API enforces rate limiting to protect their service. When using this server it is advised to avoid making excessive or bulky requests in short periods of time.
+The Paprika API enforces per-IP rate limiting (HTTP 429, with blocks that can last several minutes). Because Paprika has no "get all recipes" call, the server downloads recipes one by one when it starts:
+
+- Requests are paced (one at a time, 0.5 s apart). A first download of a few hundred recipes takes a few minutes in the background; grocery and meal-plan tools work meanwhile, and `list_recipes` returns what has arrived so far with a "still downloading" note.
+- On a 429 the download stops immediately, waits (Paprika's `Retry-After`, else 30 s doubling up to 5 min), and resumes with only the missing recipes.
+- The cache is saved to `data/recipe_cache.json` (gitignored, mode `0600`), so a restart only downloads recipes that changed. Set `PAPRIKA_RECIPE_CACHE_FILE` to use another path, or to an empty value to turn persistence off.
+
+If you were blocked, wait a few minutes before starting the server again; restarting repeatedly during a block extends it.
 
 ## Contributing
 

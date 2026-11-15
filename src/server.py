@@ -30,7 +30,9 @@ import asyncio
 import contextlib
 import copy
 import logging
+import os
 import sys
+from pathlib import Path
 from typing import Annotated, Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -215,6 +217,23 @@ async def update_recipe_partial(
     return f"Successfully updated recipe '{result['name']}' (partial update)"
 
 
+def _recipe_loading_note(client: PaprikaClient) -> str:
+    """A one-line heads-up when the recipe list may still be incomplete."""
+    if client.recipe_download_paused:
+        return (
+            "Note: Paprika is rate-limiting the recipe download, so this list "
+            "may be incomplete. It will finish on its own in a few minutes.\n\n"
+        )
+    progress = client.recipe_loading_progress
+    if progress and progress[1]:
+        done, total = progress
+        return (
+            f"Note: still downloading recipes from Paprika ({done} of {total} "
+            "so far), so this list may be incomplete.\n\n"
+        )
+    return ""
+
+
 @mcp.tool()
 @audit.audited("list_recipes")
 @_tool_errors
@@ -238,14 +257,16 @@ async def list_recipes(
     the response compact and avoids sending unnecessary ingredient text.
     Omit both to get the full catalogue with all details.
     """
-    recipes = await _client_or_raise().list_recipes(limit=limit, query=query)
+    client = _client_or_raise()
+    recipes = await client.list_recipes(limit=limit, query=query)
+    note = _recipe_loading_note(client)
     if not recipes:
         msg = (
             f"No recipes found matching '{query}'."
             if query
             else "No recipes found in your Paprika account."
         )
-        return msg
+        return note + msg
 
     if names_only:
         lines = "\n".join(
@@ -256,10 +277,10 @@ async def list_recipes(
             if query
             else f"Found {len(recipes)} recipes:\n\n"
         )
-        return header + lines
+        return note + header + lines
 
     # Full detail output
-    recipe_text = (
+    recipe_text = note + (
         f"Found {len(recipes)} recipes matching '{query}':\n\n"
         if query
         else f"Found {len(recipes)} recipes:\n\n"
@@ -894,6 +915,18 @@ async def _serve_http() -> None:
         await asyncio.gather(*(s.serve() for s in servers))
 
 
+def _recipe_cache_path() -> Path | None:
+    """Where to persist the recipe cache between restarts.
+
+    ``PAPRIKA_RECIPE_CACHE_FILE`` overrides the default
+    ``data/recipe_cache.json``; set it to an empty string to disable.
+    """
+    value = os.environ.get("PAPRIKA_RECIPE_CACHE_FILE")
+    if value is None:
+        return Path(__file__).resolve().parent.parent / "data" / "recipe_cache.json"
+    return Path(value).expanduser() if value.strip() else None
+
+
 def run_server():
     """Synchronous entry point for the console script (`paprika-mcp`)."""
     global _client
@@ -901,7 +934,9 @@ def run_server():
         _apply_schema_inlining()
         config = get_config()
         _client = PaprikaClient(
-            username=config.paprika_username, password=config.paprika_password
+            username=config.paprika_username,
+            password=config.paprika_password,
+            cache_file=_recipe_cache_path(),
         )
         if _HTTP_MODE:
             # _serve_http owns the loop: both OAuth and the optional no-auth LAN

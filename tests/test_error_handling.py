@@ -88,8 +88,25 @@ class TestHttpStatusMapping:
         response = AsyncMock()
         response.status = status
         response.text = AsyncMock(return_value="slow down")
-        with pytest.raises(PaprikaRateLimitedError):
+        response.headers = {}
+        with pytest.raises(PaprikaRateLimitedError) as exc_info:
             await client._parse_response(response, "/sync/groceries")
+        assert exc_info.value.retry_after is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "header, expected", [("42", 42.0), ("Wed, 21 Oct 2026 07:28:00 GMT", None)]
+    )
+    async def test_rate_limit_reads_retry_after(self, client, header, expected):
+        response = AsyncMock()
+        response.status = 429
+        response.text = AsyncMock(return_value="slow down")
+        response.headers = {"Retry-After": header}
+        with pytest.raises(PaprikaRateLimitedError) as exc_info:
+            await client._parse_response(response, "/sync/recipe/x/")
+        assert exc_info.value.retry_after == expected
+        # Never leaks into the client-visible structuredContent.
+        assert "retry_after" not in exc_info.value.extra
 
     @pytest.mark.asyncio
     async def test_other_5xx_maps_to_generic(self, client):
